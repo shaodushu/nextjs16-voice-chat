@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import path from 'path'
 import fs from 'fs'
 import { buildSystemPrompt } from '../lib/ai/system-prompts'
+import { OpenClawClient } from './openclaw-client'
 
 // Opus for TTS audio encoding (server → browser)
 let OpusEncoder: new (rate: number, channels: number) => { encode: (buf: Buffer) => Buffer; decode: (buf: Buffer) => Buffer; destroy: () => void }
@@ -33,6 +34,16 @@ if (fs.existsSync(envLocal)) {
 const WS_PORT = parseInt(process.env.WS_PORT ?? '3001', 10)
 const ASR_SERVER = `http://localhost:${process.env.ASR_PORT ?? '3003'}`
 const TTS_SERVER = `http://localhost:${process.env.TTS_PORT ?? '3004'}`
+
+// Chat backend: "deepseek" (default) or "openclaw"
+const CHAT_BACKEND = process.env.CHAT_BACKEND ?? 'deepseek'
+const OPENCLAW_AGENT_ID = process.env.OPENCLAW_AGENT_ID ?? 'main'
+
+function getOpenClawClient(): OpenClawClient {
+  return new OpenClawClient(OPENCLAW_AGENT_ID, {
+    DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY ?? '',
+  })
+}
 
 const httpServer = createServer()
 const wss = new WebSocketServer({ server: httpServer })
@@ -88,7 +99,7 @@ async function processAccumulatedAudio(session: Session, ws: WebSocket): Promise
     const text = await transcribeAudio(wavData)
     ws.send(JSON.stringify({ type: 'event', event: 'asr.final', payload: { text } }))
     if (text.trim()) {
-      await handleDeepSeekChat(session, ws, text)
+      await handleChat(session, ws, text)
     }
   } catch (err) {
     console.error('[ASR] error:', err)
@@ -320,6 +331,88 @@ async function synthesizeAndEncodeOpus(text: string): Promise<Buffer | null> {
   }
 }
 
+/** Run chat via OpenClaw agent (subprocess) and send chat.sentence/chat.final events */
+function handleOpenClawChat(
+  session: Session,
+  ws: WebSocket,
+  text: string,
+): Promise<void> {
+  return new Promise((resolve) => {
+    session.history.push({ role: 'user', content: text })
+    session.sentenceBuffer = ''
+
+    session.abortController?.abort()
+    const ac = new AbortController()
+    session.abortController = ac
+
+    const client = getOpenClawClient()
+    const handle = client.chat(text, {
+      onFinal: (responseText: string) => {
+        if (ac.signal.aborted) return
+        session.abortController = null
+        session.history.push({ role: 'assistant', content: responseText })
+
+        // Split response into sentences for TTS streaming
+        session.sentenceBuffer = responseText
+        const { complete, remainder } = extractSentences(session.sentenceBuffer)
+        let seq = 0
+        for (const sentence of complete) {
+          seq++
+          ws.send(JSON.stringify({
+            type: 'event',
+            event: 'chat.sentence',
+            payload: { text: sentence, seq },
+          }))
+        }
+        if (remainder.trim()) {
+          seq++
+          ws.send(JSON.stringify({
+            type: 'event',
+            event: 'chat.sentence',
+            payload: { text: remainder.trim(), seq },
+          }))
+        }
+
+        ws.send(JSON.stringify({
+          type: 'event',
+          event: 'chat.final',
+          payload: { text: responseText },
+        }))
+        resolve()
+      },
+
+      onError: (error: string) => {
+        if (ac.signal.aborted) { resolve(); return }
+        session.abortController = null
+        ws.send(JSON.stringify({
+          type: 'event',
+          event: 'chat.final',
+          payload: { text: `抱歉，出了点问题：${error}` },
+        }))
+        resolve()
+      },
+    })
+
+    ac.signal.addEventListener('abort', () => {
+      handle.abort()
+      resolve()
+    })
+  })
+}
+
+/** Route chat to the configured backend */
+function handleChat(
+  session: Session,
+  ws: WebSocket,
+  text: string,
+  features?: { emotion?: string; prosody?: { speed: number; pitchVariation: number; energy: number } },
+): Promise<void> {
+  if (CHAT_BACKEND === 'openclaw') {
+    return handleOpenClawChat(session, ws, text)
+  }
+  return handleDeepSeekChat(session, ws, text, features)
+}
+
 /** Run DeepSeek streaming and send chat.delta/chat.sentence/chat.final events */
 async function handleDeepSeekChat(
   session: Session,
@@ -500,7 +593,7 @@ wss.on('connection', (ws) => {
       if (msg.method === 'chat.send') {
         const { text, features } = msg.payload ?? {}
         try {
-          await handleDeepSeekChat(session, ws, text, features)
+          await handleChat(session, ws, text, features)
           ws.send(JSON.stringify({ type: 'res', id: msg.id, ok: true }))
         } catch (err) {
           if (err instanceof Error && err.name === 'AbortError') {
@@ -557,3 +650,6 @@ wss.on('connection', (ws) => {
 httpServer.listen(WS_PORT, () => {
   console.log(`WebSocket 服务器运行在 ws://localhost:${WS_PORT}`)
 })
+
+process.on('SIGTERM', () => process.exit())
+process.on('SIGINT', () => process.exit())

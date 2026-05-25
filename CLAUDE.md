@@ -89,7 +89,8 @@
 - `lib/utils/cn.ts` — `clsx` + `tailwind-merge` 工具函数
 
 ### 服务端 (server/)
-- `server/ws-server.ts` — WebSocket 中继：PCM 接收、DeepSeek 流式请求、句子级 TTS 切句触发、Opus TTS 编码推送
+- `server/ws-server.ts` — WebSocket 中继：PCM 接收、DeepSeek/OpenClaw 流式请求、句子级 TTS 切句触发、Opus TTS 编码推送
+- `server/openclaw-client.ts` — OpenClaw 子进程客户端：调用 `openclaw agent --local` 驱动 agent 对话
 - `server/asr-cloud-server.py` — 云端 ASR HTTP 代理（POST 到 ai-platform 的 SenseVoiceSmall API）
 - `server/tts-cloud-server.py` — 云端 TTS HTTP 代理（POST 到 ai-platform 的 IndexTTS-1.5 API）
 - `server/asr-server.py` — 本地 FunASR SenseVoice CPU ASR（备选）
@@ -145,6 +146,20 @@ TTS_API_KEY=sk-...
 TTS_MODEL=IndexTTS-1.5
 TTS_VOICE=杜小雯
 ```
+
+### Chat 后端切换
+
+通过 `CHAT_BACKEND` 环境变量选择对话后端：
+
+| 值 | 后端 | 用途 |
+|------|--------|------|
+| `deepseek`（默认） | DeepSeek API 直连 | 纯 LLM 对话 |
+| `openclaw` | OpenClaw Gateway（`ws://127.0.0.1:18792`） | 带 agent 能力（工具调用、记忆、技能） |
+
+OpenClaw 模式下额外需配置：
+- `OPENCLAW_GATEWAY_URL` — OpenClaw Gateway WebSocket 地址
+- `OPENCLAW_GATEWAY_TOKEN` — Gateway 认证 token
+- `OPENCLAW_SESSION_KEY` — Session 路由 key（默认 `main`）
 
 ## 重要设计决策
 
