@@ -3,6 +3,7 @@ export class AudioCapture {
   private audioContext: AudioContext | null = null
   private analyser: AnalyserNode | null = null
   private source: MediaStreamAudioSourceNode | null = null
+  private highpassFilter: BiquadFilterNode | null = null
   private scriptProcessor: ScriptProcessorNode | null = null
   private animationId: number | null = null
   private onVolume: ((volume: number) => void) | null = null
@@ -12,6 +13,12 @@ export class AudioCapture {
   // PCM capture for ASR
   private pcmChunks: Float32Array[] = []
   private isCapturingPcm = false
+
+  // Noise reduction state
+  private noiseFloor = 0.01
+  private readonly noiseGateMultiplier = 2.0
+  private readonly targetRms = 0.12
+  private readonly maxGain = 2.0
 
   setOnVolume(cb: (volume: number) => void) {
     this.onVolume = cb
@@ -36,15 +43,53 @@ export class AudioCapture {
     })
     this.source = this.audioContext.createMediaStreamSource(this.stream)
 
+    // Highpass filter: remove sub-80Hz rumble (AC, fans, road noise)
+    this.highpassFilter = this.audioContext.createBiquadFilter()
+    this.highpassFilter.type = 'highpass'
+    this.highpassFilter.frequency.value = 80
+    this.highpassFilter.Q.value = 0.7
+    this.source.connect(this.highpassFilter)
+
     // Analyser for VAD volume
     this.analyser = this.audioContext.createAnalyser()
     this.analyser.fftSize = 256
-    this.source.connect(this.analyser)
+    this.highpassFilter.connect(this.analyser)
 
     // ScriptProcessor for raw PCM capture (deprecated but universally supported)
     this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1)
     this.scriptProcessor.onaudioprocess = (e) => {
-      const chunk = new Float32Array(e.inputBuffer.getChannelData(0))
+      const raw = e.inputBuffer.getChannelData(0)
+      const chunk = new Float32Array(raw.length)
+
+      // Step 1: Noise gate — zero out frames below noise floor
+      // Step 2: Gain normalization — bring average RMS toward target
+      let sumSq = 0
+      for (let i = 0; i < raw.length; i++) {
+        let sample = raw[i]
+        // Noise gate
+        if (Math.abs(sample) < this.noiseFloor) {
+          sample = 0
+        }
+        chunk[i] = sample
+        sumSq += sample * sample
+      }
+
+      // Adaptive noise floor tracking (update during silence)
+      const rms = Math.sqrt(sumSq / raw.length)
+      if (rms < this.noiseFloor * this.noiseGateMultiplier) {
+        // Slowly decay noise floor toward current RMS
+        this.noiseFloor += (rms - this.noiseFloor) * 0.01
+        this.noiseFloor = Math.max(0.001, Math.min(this.noiseFloor, 0.05))
+      }
+
+      // Gain normalization — only boost when there's meaningful signal
+      if (rms > this.noiseFloor * this.noiseGateMultiplier && rms < this.targetRms) {
+        const gain = Math.min(this.targetRms / (rms || 0.001), this.maxGain)
+        for (let i = 0; i < chunk.length; i++) {
+          chunk[i] = Math.max(-1, Math.min(1, chunk[i] * gain))
+        }
+      }
+
       // Always stream to server via WebSocket (independent of VAD state)
       this.onAudioChunk?.(chunk)
       // Local PCM backup for HTTP fallback
@@ -52,7 +97,7 @@ export class AudioCapture {
         this.pcmChunks.push(chunk)
       }
     }
-    this.source.connect(this.scriptProcessor)
+    this.highpassFilter.connect(this.scriptProcessor)
     this.scriptProcessor.connect(this.audioContext.destination)
 
     this.startVolumeMeter()
@@ -147,6 +192,10 @@ export class AudioCapture {
     if (this.scriptProcessor) {
       this.scriptProcessor.disconnect()
       this.scriptProcessor = null
+    }
+    if (this.highpassFilter) {
+      this.highpassFilter.disconnect()
+      this.highpassFilter = null
     }
     this.stream?.getTracks().forEach((t) => t.stop())
     this.audioContext?.close()
