@@ -52,6 +52,7 @@ export default function VoiceChatPage() {
   const opusSourceRef = useRef<AudioBufferSourceNode | null>(null)
   const opusPendingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSentenceTextRef = useRef('')
+  const spokenSentencesRef = useRef('')
 
   // Init audio, TTS, Opus decoder, and WebSocket on mount
   useEffect(() => {
@@ -60,6 +61,14 @@ export default function VoiceChatPage() {
     const tts = new OllamaTTS()
     tts.onIdle = () => {
       useVoiceStore.getState().setAudioState(AudioState.Recording)
+    }
+    // Sync text display with TTS audio playback — text appears when audio starts playing
+    tts.onChunkStart = () => {
+      const store = useVoiceStore.getState()
+      const text = spokenSentencesRef.current
+      if (text) {
+        store.setStreamingText(text)
+      }
     }
     localTTSRef.current = tts
 
@@ -101,18 +110,20 @@ export default function VoiceChatPage() {
           store.setMode('cloud')
           store.setCurrentEmotion(intent.emotion)
           store.setStreamingText('')
+          spokenSentencesRef.current = ''
           store.setAudioState(AudioState.Speaking)
           return
         }
 
         if (event.event === 'chat.delta' && event.payload.text) {
-          store.setStreamingText(store.streamingText + event.payload.text)
+          // Delta is for internal tracking only — text display is driven by sentences
         }
 
-        // Sentence received — send to TTS immediately for streaming playback
+        // Sentence received — add to TTS queue; text display is synced by onChunkStart
         if (event.event === 'chat.sentence' && event.payload.text) {
           const text = event.payload.text
           lastSentenceTextRef.current = text
+          spokenSentencesRef.current += text
 
           // Always start HTTP TTS (reliable path)
           const tts = localTTSRef.current
@@ -253,6 +264,8 @@ export default function VoiceChatPage() {
 
     setIsInterrupted(true)
     setAudioState(AudioState.Interrupted)
+    spokenSentencesRef.current = ''
+    setStreamingText('')
     ws?.abort('user_interrupted')
     setTimeout(() => setIsInterrupted(false), 2000)
   }, [setAudioState, setIsInterrupted])
@@ -272,6 +285,7 @@ export default function VoiceChatPage() {
       setCurrentEmotion(intent.emotion)
       setAudioState(AudioState.Speaking)
       setStreamingText('')
+      spokenSentencesRef.current = ''
 
       wsRef.current?.send('chat.send', {
         text,
@@ -322,7 +336,7 @@ export default function VoiceChatPage() {
 
     try {
       const capture = new AudioCapture()
-      const vad = new VADProcessor({ threshold: 0.12, minSpeechFrames: 6, minSilenceFrames: 25 })
+      const vad = new VADProcessor({ baseThreshold: 0.08, minSpeechFrames: 4, minSilenceFrames: 20 })
       capture.setOnVolume(setVolume)
 
       // Stream PCM chunks to server during recording
@@ -336,12 +350,18 @@ export default function VoiceChatPage() {
       })
 
       vad.setOnSpeechStart(() => {
-        // Guard: skip if interrupted within last 2s (prevents rapid re-triggering)
-        if (Date.now() - lastInterruptRef.current < 2000) return
+        // Guard: skip if interrupted within last 500ms (prevents rapid re-triggering)
+        if (Date.now() - lastInterruptRef.current < 500) return
 
         const currentState = useVoiceStore.getState().audioState
-        if (currentState === AudioState.Speaking || currentState === AudioState.Processing) {
-          handleInterrupt()
+        if (currentState === AudioState.Speaking) {
+          // Stop local TTS/audio but DON'T abort the LLM — audio will accumulate on server
+          localTTSRef.current?.stop()
+          if (opusSourceRef.current) {
+            try { opusSourceRef.current.stop(); opusSourceRef.current.disconnect() } catch {}
+            opusSourceRef.current = null
+          }
+          lastInterruptRef.current = Date.now()
         }
         setAudioState(AudioState.Recording)
 
@@ -390,7 +410,7 @@ export default function VoiceChatPage() {
       <InterruptionBanner isInterrupted={isInterrupted} />
       <Header wsConnected={wsConnected} mode={mode} />
       <StatusBar audioState={audioState} mode={mode} />
-      <ChatPanel messages={messages} streamingText={streamingText} />
+      <ChatPanel messages={messages} streamingText={streamingText} isSpeakingWithoutText={audioState === AudioState.Speaking && !streamingText} />
       <AudioVisualizer
         volume={volume}
         isActive={isRecording || audioState === AudioState.Speaking}

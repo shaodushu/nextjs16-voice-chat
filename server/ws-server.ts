@@ -46,12 +46,88 @@ interface Session {
   audioBuffer: Buffer[]
   /** Browser supports Opus TTS → send WebSocket binary instead of HTTP TTS */
   opusTTS: boolean
+  /** Cooldown timer for coalescing utterances across LLM cycles */
+  asrCooldownTimer: ReturnType<typeof setTimeout> | null
+  /** Timestamp of most recent asr.audio_end */
+  lastUtteranceTime: number
+  /** True while ASR or LLM is actively processing */
+  asrProcessing: boolean
 }
 
 /** Maximum chars to accumulate before force-flushing a partial TTS sentence */
 const MAX_PARTIAL_CHARS = 20
 /** Emergency raw flush (no punctuation found) — very high to avoid choppy segments */
 const MAX_EMERGENCY_CHARS = 35
+/** Silent gap required before processing accumulated audio (ms) */
+const ASR_COOLDOWN_MS = 3000
+
+/** Process accumulated audio: ASR → if text, LLM. Sets asrProcessing guard. */
+async function processAccumulatedAudio(session: Session, ws: WebSocket): Promise<void> {
+  if (session.asrProcessing) return
+  session.asrProcessing = true
+  const pcmData = Buffer.concat(session.audioBuffer)
+  session.audioBuffer = []
+
+  if (pcmData.length < 640) {
+    ws.send(JSON.stringify({ type: 'event', event: 'asr.final', payload: { text: '' } }))
+    session.asrProcessing = false
+    return
+  }
+
+  const debugWav = pcmToWav(pcmData)
+  const _fs = await import('fs')
+  const _path = await import('path')
+  const debugDir = _path.join(process.cwd(), 'debug')
+  if (!_fs.existsSync(debugDir)) _fs.mkdirSync(debugDir, { recursive: true })
+  const debugFile = _path.join(debugDir, `asr_${Date.now()}.wav`)
+  _fs.writeFileSync(debugFile, debugWav)
+  console.log(`[ASR] Coalesced: ${debugFile}, ${debugWav.length} bytes`)
+
+  try {
+    const wavData = pcmToWav(pcmData)
+    const text = await transcribeAudio(wavData)
+    ws.send(JSON.stringify({ type: 'event', event: 'asr.final', payload: { text } }))
+    if (text.trim()) {
+      await handleDeepSeekChat(session, ws, text)
+    }
+  } catch (err) {
+    console.error('[ASR] error:', err)
+    ws.send(JSON.stringify({
+      type: 'event', event: 'asr.final',
+      payload: { text: '', error: err instanceof Error ? err.message : 'ASR failed' },
+    }))
+  }
+  session.asrProcessing = false
+
+  // After processing completes, if more audio accumulated (during LLM), start a new cooldown
+  if (session.audioBuffer.reduce((s, b) => s + b.length, 0) >= 640) {
+    scheduleCooldown(session, ws)
+  }
+}
+
+/** Cancel cooldown timer */
+function clearCooldown(session: Session): void {
+  if (session.asrCooldownTimer !== null) {
+    clearTimeout(session.asrCooldownTimer)
+    session.asrCooldownTimer = null
+  }
+}
+
+/** Schedule cooldown check — ensures enough silent gap since last utterance */
+function scheduleCooldown(session: Session, ws: WebSocket): void {
+  clearCooldown(session)
+  session.asrCooldownTimer = setTimeout(() => {
+    session.asrCooldownTimer = null
+    const elapsed = Date.now() - session.lastUtteranceTime
+    if (elapsed < ASR_COOLDOWN_MS) {
+      // User spoke again during cooldown — reschedule for remaining time
+      scheduleCooldown(session, ws)
+      return
+    }
+    // Sufficient silence — process accumulated audio
+    processAccumulatedAudio(session, ws)
+  }, ASR_COOLDOWN_MS)
+}
 
 function extractSentences(buffer: string): { complete: string[]; remainder: string } {
   const sentences: string[] = []
@@ -91,6 +167,7 @@ function pcmToWav(pcmData: Buffer): Buffer {
   const byteRate = sampleRate * numChannels * bitsPerSample / 8
   const blockAlign = numChannels * bitsPerSample / 8
   const dataSize = pcmData.length
+
   const header = Buffer.alloc(44)
 
   header.write('RIFF', 0)
@@ -269,8 +346,9 @@ async function handleDeepSeekChat(
   const ac = new AbortController()
   session.abortController = ac
 
-  const deepseekRes = await fetch(
-    `${process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1'}/chat/completions`,
+  try {
+    const deepseekRes = await fetch(
+      `${process.env.DEEPSEEK_API_URL ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1'}/chat/completions`,
     {
       method: 'POST',
       headers: {
@@ -312,7 +390,8 @@ async function handleDeepSeekChat(
       try {
         const parsed = JSON.parse(data)
         const delta = parsed.choices?.[0]?.delta
-        const deltaText = (delta?.content || delta?.reasoning_content || '').trimEnd()
+        // Only use content, skip reasoning_content to avoid thinking output
+        const deltaText = (delta?.content || '').trimEnd()
         if (deltaText) {
           fullText += deltaText
           session.sentenceBuffer += deltaText
@@ -379,13 +458,21 @@ async function handleDeepSeekChat(
     event: 'chat.final',
     payload: { text: fullText },
   }))
+} finally {
+  session.abortController = null
+
+  // If audio accumulated during LLM, start cooldown for next cycle
+  if (session.audioBuffer.length > 0 && session.audioBuffer.reduce((s, b) => s + b.length, 0) >= 640) {
+    scheduleCooldown(session, ws)
+  }
+}
 }
 
 const sessions = new Map<string, Session>()
 
 wss.on('connection', (ws) => {
   const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-  const session: Session = { ws, history: [], abortController: null, sentenceBuffer: '', audioBuffer: [], opusTTS: false }
+  const session: Session = { ws, history: [], abortController: null, sentenceBuffer: '', audioBuffer: [], opusTTS: false, asrCooldownTimer: null, lastUtteranceTime: 0, asrProcessing: false }
   sessions.set(sessionId, session)
 
   ws.on('message', async (raw, isBinary) => {
@@ -431,46 +518,24 @@ wss.on('connection', (ws) => {
       }
 
       if (msg.method === 'asr.audio_end') {
-        try {
-          const pcmData = Buffer.concat(session.audioBuffer)
-          session.audioBuffer = []
+        // Record utterance time for cooldown tracking
+        session.lastUtteranceTime = Date.now()
 
-          if (pcmData.length < 320) { // Less than 10ms of audio
-            ws.send(JSON.stringify({ type: 'event', event: 'asr.final', payload: { text: '' } }))
-            return
-          }
-
-          const wavData = pcmToWav(pcmData)
-          const text = await transcribeAudio(wavData)
-
-          ws.send(JSON.stringify({
-            type: 'event',
-            event: 'asr.final',
-            payload: { text },
-          }))
-
-          // Auto-start LLM if we got text
-          if (text.trim()) {
-            handleDeepSeekChat(session, ws, text, msg.payload?.features).catch((err) => {
-              if (err instanceof Error && err.name !== 'AbortError') {
-                console.error('[WS] DeepSeek error after ASR:', err)
-              }
-            })
-          }
-        } catch (err) {
-          console.error('[WS] ASR error:', err)
-          ws.send(JSON.stringify({
-            type: 'event',
-            event: 'asr.final',
-            payload: { text: '', error: err instanceof Error ? err.message : 'ASR failed' },
-          }))
+        // If ASR or LLM is actively processing, audio accumulates for next cycle
+        if (session.asrProcessing || session.abortController !== null) {
+          console.log('[WS] Processing active, audio accumulates for next cycle')
+          return
         }
+
+        // Start/restart cooldown timer
+        scheduleCooldown(session, ws)
         return
       }
 
       if (msg.method === 'chat.abort') {
         session.abortController?.abort()
         session.abortController = null
+        clearCooldown(session)
         return
       }
     } catch (err) {

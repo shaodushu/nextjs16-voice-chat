@@ -9,10 +9,11 @@ import { cn } from '@/lib/utils/cn'
 interface ChatPanelProps {
   messages: ConversationTurn[]
   streamingText: string
+  isSpeakingWithoutText?: boolean
   className?: string
 }
 
-export function ChatPanel({ messages, streamingText, className }: ChatPanelProps) {
+export function ChatPanel({ messages, streamingText, isSpeakingWithoutText, className }: ChatPanelProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -41,13 +42,21 @@ export function ChatPanel({ messages, streamingText, className }: ChatPanelProps
         </div>
       ))}
 
-      {streamingText && (
+      {streamingText ? (
         <div className="flex justify-start animate-fade-in">
           <div className="max-w-[80%] rounded-2xl rounded-bl-md px-4 py-2.5 bg-white shadow-sm border border-gray-100">
             <StreamingText text={streamingText} />
           </div>
         </div>
-      )}
+      ) : isSpeakingWithoutText ? (
+        <div className="flex justify-start animate-fade-in">
+          <div className="max-w-[80%] rounded-2xl rounded-bl-md px-4 py-2.5 bg-white shadow-sm border border-gray-100">
+            <p className="text-sm text-gray-400">
+              <span className="animate-pulse">...</span>
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       <div ref={bottomRef} />
     </div>

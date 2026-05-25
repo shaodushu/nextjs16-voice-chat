@@ -3,11 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"next dev --hostname 0.0.0.0 --experimental-https --experimental-https-key certificates/localhost-key.pem --experimental-https-cert certificates/localhost.pem\" \"tsx watch server/ws-server.ts\" \"python3 server/asr-server.py\" \"python3 server/tts-server.py\"",
+    "dev": "concurrently \"next dev --hostname 0.0.0.0 --experimental-https --experimental-https-key certificates/localhost-key.pem --experimental-https-cert certificates/localhost.pem\" \"tsx watch server/ws-server.ts\" \"python3 server/asr-cloud-server.py\" \"python3 server/tts-cloud-server.py\"",
     "dev:next": "next dev --hostname 0.0.0.0 --experimental-https --experimental-https-key certificates/localhost-key.pem --experimental-https-cert certificates/localhost.pem",
     "dev:ws": "tsx watch server/ws-server.ts",
-    "dev:asr": "python3 server/asr-server.py",
-    "dev:tts": "python3 server/tts-server.py",
+    "dev:asr": "python3 server/asr-cloud-server.py",
+    "dev:tts": "python3 server/tts-cloud-server.py",
+    "dev:asr:local": "python3 server/asr-server.py",
+    "dev:tts:local": "python3 server/tts-server.py",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

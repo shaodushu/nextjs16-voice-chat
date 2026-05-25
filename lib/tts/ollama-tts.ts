@@ -8,6 +8,10 @@ export class OllamaTTS {
   /** Called when the TTS queue becomes completely idle */
   onIdle: (() => void) | null = null
 
+  /** Called when a TTS chunk actually starts playing (audio begins).
+   *  Text is the sentence being spoken — use this to sync text display with audio. */
+  onChunkStart: ((text: string) => void) | null = null
+
   /** Ensure the AudioContext is ready for playback.
    *  Call `warmup()` from a user-gesture handler (mic button click) to
    *  create the context with a valid user activation — prevents autoplay
@@ -79,6 +83,10 @@ export class OllamaTTS {
       })
       .then((audioBuffer) => {
         if (!audioBuffer) return // handled in previous then
+
+        // Fire onChunkStart right before audio playback begins
+        // This lets the UI sync text display with actual audio timing
+        this.onChunkStart?.(text)
 
         const source = ctx.createBufferSource()
         source.buffer = audioBuffer
